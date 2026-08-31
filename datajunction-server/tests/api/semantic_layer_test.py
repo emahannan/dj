@@ -14,12 +14,16 @@ from httpx import AsyncClient
 
 from datajunction_server.api.semantic_layer import (
     MAX_ROW_LIMIT,
+    ColumnInfo,
     FilterPayload,
+    GeneratedSQLResponse,
     _arrow_type_name,
     _dimensions_payload,
     _filter_to_sql,
     _metrics_payload,
     _quote_value,
+    _row_count_response,
+    _values_response,
 )
 from datajunction_server.errors import DJException
 
@@ -47,6 +51,24 @@ class TestFilterToSql:
         flt = FilterPayload(column=None, operator="=", value="x")
         with pytest.raises(DJException) as exc:
             _filter_to_sql(flt)
+        assert exc.value.http_status_code == 400
+
+    def test_in_quotes_each_value(self):
+        flt = FilterPayload(
+            column="ns.dim",
+            operator="IN",
+            value=["North", "O'Brien"],
+        )
+        assert _filter_to_sql(flt) == "ns.dim IN ('North', 'O\\'Brien')"
+
+    def test_between_requires_two_values(self):
+        flt = FilterPayload(column="ns.dim", operator="between", value=[1, 10])
+        assert _filter_to_sql(flt) == "ns.dim BETWEEN 1 AND 10"
+
+        with pytest.raises(DJException) as exc:
+            _filter_to_sql(
+                FilterPayload(column="ns.dim", operator="between", value=[1]),
+            )
         assert exc.value.http_status_code == 400
 
 
@@ -181,6 +203,34 @@ class TestSemanticViewPayloadTypes:
 
         assert metrics[0].type == "floating"
         assert dimensions[0].type == "utf8"
+
+
+class TestDerivedSQLResponses:
+    generated = GeneratedSQLResponse(
+        sql="SELECT region_name, SUM(amount) AS amount FROM sales GROUP BY 1;",
+        dialect="trino",
+        columns=[
+            ColumnInfo(name="region_name", type="string"),
+            ColumnInfo(name="amount", type="double"),
+        ],
+        cube_name="sem.sales_cube",
+    )
+
+    def test_row_count_wraps_query_and_replaces_columns(self):
+        result = _row_count_response(self.generated)
+
+        assert result.sql.startswith("SELECT COUNT(*) AS COUNT FROM (")
+        assert result.sql.endswith(") AS semantic_query")
+        assert ";)" not in result.sql
+        assert result.columns == [ColumnInfo(name="COUNT", type="bigint")]
+        assert result.dialect == "trino"
+
+    def test_values_projects_first_column_distinctly(self):
+        result = _values_response(self.generated)
+
+        assert result.sql.startswith('SELECT DISTINCT "region_name" FROM (')
+        assert result.sql.endswith(") AS semantic_values")
+        assert result.columns == [ColumnInfo(name="region_name", type="string")]
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +415,40 @@ async def test_semantic_endpoints_end_to_end(client: AsyncClient):
     assert "SELECT" in sql_body["sql"].upper()
     assert sql_body["columns"]
 
+    # /row-count wraps the same semantic query in COUNT(*).
+    resp = await _expect(
+        await client.post(f"/semantic/views/{view}/row-count", json=query),
+        200,
+    )
+    count_body = resp.json()
+    assert "COUNT(*) AS COUNT" in count_body["sql"]
+    assert count_body["columns"] == [{"name": "COUNT", "type": "bigint"}]
+    assert count_body["dialect"] == "trino"
+
+    # /values returns a filtered distinct-dimension query.
+    resp = await _expect(
+        await client.post(
+            f"/semantic/views/{view}/values",
+            json={
+                "additional_configuration": {},
+                "dimension": "sem.region.region_name",
+                "filters": [
+                    {
+                        "column": "sem.region.region_name",
+                        "operator": "IN",
+                        "value": ["North", "South"],
+                    },
+                ],
+            },
+        ),
+        200,
+    )
+    values_body = resp.json()
+    assert "SELECT DISTINCT" in values_body["sql"]
+    assert " IN ('North', 'South')" in values_body["sql"]
+    assert values_body["columns"] == [{"name": "region_name", "type": "string"}]
+    assert values_body["dialect"] == "trino"
+
     # Unknown metric/dimension ids are rejected (400).
     resp = await client.post(
         f"/semantic/views/{view}/sql",
@@ -466,6 +550,17 @@ async def test_get_view_unknown_returns_404(client: AsyncClient):
     )
     assert resp.status_code == 404, resp.text
     assert "does not exist" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_values_rejects_unknown_dimension(client: AsyncClient):
+    view = await _setup_cube(client)
+    resp = await client.post(
+        f"/semantic/views/{view}/values",
+        json={"dimension": "sem.region.unknown", "filters": []},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "does not contain dimension" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

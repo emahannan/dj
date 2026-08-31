@@ -170,11 +170,25 @@ def _view_payload(cube: NodeRevision) -> "ViewDetail":
 # Filter / order translation (spec QueryPayload -> DJ build_metrics_sql args)
 # ---------------------------------------------------------------------------
 
-# Comparison operators accepted for filters; anything else (IN/LIKE/…) is rejected.
+# Comparison operators accepted for filters. These cover the portable operators
+# used by the semantic-layer spec; pattern matching remains unsupported.
 _ALLOWED_OPERATORS = frozenset(
-    {"=", "!=", ">", "<", ">=", "<=", "IS NULL", "IS NOT NULL"},
+    {
+        "=",
+        "!=",
+        ">",
+        "<",
+        ">=",
+        "<=",
+        "IN",
+        "NOT IN",
+        "BETWEEN",
+        "IS NULL",
+        "IS NOT NULL",
+    },
 )
 _NULLARY_OPERATORS = frozenset({"IS NULL", "IS NOT NULL"})
+_COLLECTION_OPERATORS = frozenset({"IN", "NOT IN"})
 
 
 def _quote_value(value: Any) -> str:
@@ -205,6 +219,22 @@ def _filter_to_sql(flt: "FilterPayload") -> str:
         )
     if op in _NULLARY_OPERATORS:
         return f"{flt.column} {op}"
+    if op in _COLLECTION_OPERATORS:
+        if not isinstance(flt.value, (list, tuple, set, frozenset)) or not flt.value:
+            raise DJException(
+                message=f"Filter operator {flt.operator} requires a non-empty list",
+                http_status_code=400,
+            )
+        values = ", ".join(_quote_value(value) for value in flt.value)
+        return f"{flt.column} {op} ({values})"
+    if op == "BETWEEN":
+        if not isinstance(flt.value, (list, tuple)) or len(flt.value) != 2:
+            raise DJException(
+                message="Filter operator BETWEEN requires exactly two values",
+                http_status_code=400,
+            )
+        start, end = (_quote_value(value) for value in flt.value)
+        return f"{flt.column} BETWEEN {start} AND {end}"
     return f"{flt.column} {op} {_quote_value(flt.value)}"
 
 
@@ -245,7 +275,16 @@ class QueryPayload(BaseModel):
 class QueryRequest(BaseModel):
     """Body for POST /views/{view_name}/sql (backs the spec's /query)."""
 
+    additional_configuration: dict[str, Any] = Field(default_factory=dict)
     query: QueryPayload
+
+
+class ValuesRequest(BaseModel):
+    """Body for POST /views/{view_name}/values."""
+
+    additional_configuration: dict[str, Any] = Field(default_factory=dict)
+    dimension: str
+    filters: list[FilterPayload] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +360,43 @@ class GeneratedSQLResponse(BaseModel):
     dialect: str
     columns: list[ColumnInfo]
     cube_name: str | None
+
+
+def _row_count_response(generated: GeneratedSQLResponse) -> GeneratedSQLResponse:
+    """Wrap generated semantic query SQL in a row count."""
+    sql = generated.sql.rstrip().removesuffix(";")
+    return GeneratedSQLResponse(
+        sql=f"SELECT COUNT(*) AS COUNT FROM ({sql}) AS semantic_query",
+        dialect=generated.dialect,
+        columns=[ColumnInfo(name="COUNT", type="bigint")],
+        cube_name=generated.cube_name,
+    )
+
+
+def _values_response(generated: GeneratedSQLResponse) -> GeneratedSQLResponse:
+    """Project the dimension from generated SQL as a distinct-values query."""
+    if not generated.columns:  # pragma: no cover - the builder always returns it
+        raise DJException(
+            message="The generated values query has no output columns.",
+            http_status_code=500,
+        )
+
+    dimension = generated.columns[0]
+    # The builder controls this alias, but quote it because valid source column
+    # names need not be bare SQL identifiers. sqlglot selects dialect-correct
+    # quoting (for example, backticks for Spark and double quotes for Trino).
+    import sqlglot
+
+    identifier = sqlglot.exp.Identifier(this=dimension.name, quoted=True).sql(
+        dialect=generated.dialect,
+    )
+    sql = generated.sql.rstrip().removesuffix(";")
+    return GeneratedSQLResponse(
+        sql=(f"SELECT DISTINCT {identifier} FROM ({sql}) AS semantic_values"),
+        dialect=generated.dialect,
+        columns=[dimension],
+        cube_name=generated.cube_name,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -468,3 +544,70 @@ async def generate_query_sql(
     except DJException as exc:
         return _problem(exc.http_status_code or 400, exc.message)
     return result
+
+
+@router.post("/views/{view_name}/row-count", response_model=GeneratedSQLResponse)
+async def generate_row_count_sql(
+    view_name: str,
+    body: QueryRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> GeneratedSQLResponse | JSONResponse:
+    """Generate SQL that counts the rows returned by a semantic query."""
+    generated = await generate_query_sql(view_name, body, session, current_user)
+    if isinstance(generated, JSONResponse):
+        return generated
+    return _row_count_response(generated)
+
+
+@router.post("/views/{view_name}/values", response_model=GeneratedSQLResponse)
+async def generate_values_sql(
+    view_name: str,
+    body: ValuesRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> GeneratedSQLResponse | JSONResponse:
+    """Generate SQL for a dimension's distinct values, optionally filtered."""
+    try:
+        cube_node = await Node.get_cube_by_name(session, view_name)
+    except DJException as exc:
+        return _problem(exc.http_status_code or 400, exc.message)
+    if cube_node is None or cube_node.current is None:
+        return _problem(404, f"View `{view_name}` does not exist.")
+
+    cube_rev = cube_node.current
+    if body.dimension not in cube_rev.cube_node_dimensions:
+        return _problem(
+            400,
+            f"View `{view_name}` does not contain dimension `{body.dimension}`.",
+        )
+
+    bad_filters = [
+        flt.column
+        for flt in body.filters
+        if flt.column and flt.column not in cube_rev.cube_node_dimensions
+    ]
+    if bad_filters:
+        return _problem(
+            400,
+            f"View `{view_name}` does not contain filter dimensions: {bad_filters}",
+        )
+
+    # DJ's metrics builder currently requires a metric. Selecting one cube metric
+    # provides the correct dimensional joins and grouping; the outer projection
+    # below discards that metric and returns only unique dimension values.
+    if not cube_rev.cube_node_metrics:  # pragma: no cover - cubes require metrics
+        return _problem(400, f"View `{view_name}` does not contain any metrics.")
+    query = QueryRequest(
+        additional_configuration=body.additional_configuration,
+        query=QueryPayload(
+            metrics=[cube_rev.cube_node_metrics[0]],
+            dimensions=[body.dimension],
+            filters=body.filters,
+        ),
+    )
+    try:
+        generated = await _generate_sql(session, query.query, cube_rev)
+        return _values_response(generated)
+    except DJException as exc:
+        return _problem(exc.http_status_code or 400, exc.message)
